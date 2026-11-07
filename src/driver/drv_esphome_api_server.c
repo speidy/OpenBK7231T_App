@@ -24,9 +24,23 @@ extern int Main_HasWiFiConnected();
 static int s_listen_sock = INVALID_SOCK;
 static xTaskHandle s_esphome_api_thread = NULL;
 static volatile int client_sock = INVALID_SOCK;
-// Serialises whole frames: the server thread (handshake replies) and the BT task
-// (advertisements, GATT results) both write to the same socket.
-static SemaphoreHandle_t s_send_mutex = NULL;
+
+// lwIP here is built without LWIP_NETCONN_FULLDUPLEX: a socket must only be
+// used by ONE thread at a time. Sending from the BT task while the server
+// thread sits in select()/recv() on the same socket corrupts lwIP/heap state
+// (seen as a hard fault in the BT stack on the next HCI send). So only the
+// server thread touches client_sock; every other task queues finished frames
+// here and the server thread writes them out between select() polls.
+typedef struct
+{
+	uint16_t len;
+	uint8_t data[];
+} tx_frame_t;
+#define TX_QUEUE_LEN 48
+#define TX_POLL_MS 20
+static QueueHandle_t s_tx_queue = NULL;
+static volatile TaskHandle_t s_server_task = NULL;
+static volatile int s_tx_dropped = 0;
 
 // Optional status LEDs (channel indices, -1 = disabled), set by BTProxyLeds
 static int s_led_red_ch = -1;
@@ -80,44 +94,76 @@ bool ESPHome_API_IsClientConnected(void)
 	return client_sock != INVALID_SOCK;
 }
 
+// Server thread only. Writes one complete frame; a frame cut off half-way would
+// desync the stream, so in that case the client is dropped.
+static bool ESPHome_API_WriteFrame(int sock, const uint8_t* buf, int len, bool droppable)
+{
+	int n = ESPHome_API_SendAll(sock, buf, len, droppable);
+	if(n == len) return true;
+	if(n > 0)
+	{
+		ADDLOG_ERROR(LOG_FEATURE_DRV, "ESPHomeAPI: send failed mid-frame (%d/%d), dropping client", n, len);
+		shutdown(sock, SHUT_RDWR);
+	}
+	return false;
+}
+
+// Server thread only: write out (or, with sock == INVALID_SOCK, discard) queued frames.
+static void ESPHome_API_DrainTx(int sock)
+{
+	tx_frame_t* f;
+	if(s_tx_queue == NULL) return;
+	while(xQueueReceive(s_tx_queue, &f, 0) == pdTRUE)
+	{
+		if(sock != INVALID_SOCK)
+		{
+			ESPHome_API_WriteFrame(sock, f->data, f->len, false);
+		}
+		os_free(f);
+	}
+}
+
 bool ESPHome_API_SendFrame(uint32_t msg_type, const uint8_t* payload, uint32_t payload_len, bool droppable)
 {
-	if(client_sock == INVALID_SOCK || s_send_mutex == NULL) return false;
+	if(client_sock == INVALID_SOCK || s_tx_queue == NULL) return false;
 	uint8_t header[16];
 	uint8_t* ptr = header;
 	*ptr++ = 0x00; // Preamble
 	ESPHome_API_EncodeVarint(&ptr, payload_len);
 	ESPHome_API_EncodeVarint(&ptr, msg_type);
 	int header_len = ptr - header;
+	int total = header_len + payload_len;
 
-	bool ok = false;
-	xSemaphoreTake(s_send_mutex, portMAX_DELAY);
-	int sock = client_sock;
-	if(sock != INVALID_SOCK)
+	tx_frame_t* f = (tx_frame_t*)os_malloc(sizeof(tx_frame_t) + total);
+	if(!f)
 	{
-		int n = ESPHome_API_SendAll(sock, header, header_len, droppable);
-		if(n == header_len)
-		{
-			ok = true;
-			if(payload_len > 0)
-			{
-				// once the header is out, the payload must follow or the stream is corrupt
-				ok = ESPHome_API_SendAll(sock, payload, payload_len, false) == (int)payload_len;
-			}
-			if(!ok)
-			{
-				ADDLOG_ERROR(LOG_FEATURE_DRV, "ESPHomeAPI: send failed mid-frame (type %d), dropping client", msg_type);
-				shutdown(sock, SHUT_RDWR);
-			}
-		}
-		else if(n > 0)
-		{
-			ADDLOG_ERROR(LOG_FEATURE_DRV, "ESPHomeAPI: partial header send, dropping client");
-			shutdown(sock, SHUT_RDWR);
-		}
+		s_tx_dropped++;
+		return false;
 	}
-	xSemaphoreGive(s_send_mutex);
-	return ok;
+	f->len = (uint16_t)total;
+	memcpy(f->data, header, header_len);
+	if(payload_len) memcpy(f->data + header_len, payload, payload_len);
+
+	if(xTaskGetCurrentTaskHandle() == s_server_task)
+	{
+		// Already on the socket's thread: keep ordering with anything queued, then write.
+		int sock = client_sock;
+		ESPHome_API_DrainTx(sock);
+		bool ok = sock != INVALID_SOCK && ESPHome_API_WriteFrame(sock, f->data, f->len, droppable);
+		os_free(f);
+		return ok;
+	}
+
+	// Advertisements are dropped if the queue is full; GATT results wait briefly.
+	TickType_t wait = droppable ? 0 : pdMS_TO_TICKS(500);
+	if(xQueueSend(s_tx_queue, &f, wait) != pdTRUE)
+	{
+		os_free(f);
+		if(!droppable) ADDLOG_ERROR(LOG_FEATURE_DRV, "ESPHomeAPI: TX queue full, dropped frame type %d", msg_type);
+		s_tx_dropped++;
+		return false;
+	}
+	return true;
 }
 
 static void ESPHome_API_TCP_Server_Thread(void* param)
@@ -162,15 +208,18 @@ static void ESPHome_API_TCP_Server_Thread(void* param)
 	}
 
 	ADDLOG_INFO(LOG_FEATURE_DRV, "ESPHomeAPI: TCP Server listening on port %d", ESPHOME_API_PORT);
+	s_server_task = xTaskGetCurrentTaskHandle();
 
 	while(1)
 	{
 		struct sockaddr_storage source_addr;
 		socklen_t addr_len = sizeof(source_addr);
-		client_sock = accept(s_listen_sock, (struct sockaddr*)&source_addr, &addr_len);
+		int new_sock = accept(s_listen_sock, (struct sockaddr*)&source_addr, &addr_len);
 
-		if(client_sock != INVALID_SOCK)
+		if(new_sock != INVALID_SOCK)
 		{
+			ESPHome_API_DrainTx(INVALID_SOCK); // stale frames from a previous client
+			client_sock = new_sock;
 			// Blocking socket + select(): on some SDKs (RTL87X0C) a non-blocking
 			// recv() with no data returns -1 with errno == 0, which is
 			// indistinguishable from a real error.
@@ -193,8 +242,10 @@ static void ESPHome_API_TCP_Server_Thread(void* param)
 				fd_set rfds;
 				FD_ZERO(&rfds);
 				FD_SET(client_sock, &rfds);
-				struct timeval tv = { 0, 200 * 1000 };
+				// Short poll so frames queued by other tasks go out promptly.
+				struct timeval tv = { 0, TX_POLL_MS * 1000 };
 				int sel = select(client_sock + 1, &rfds, NULL, NULL, &tv);
+				ESPHome_API_DrainTx(client_sock);
 				if(sel == 0) continue;
 				if(sel < 0)
 				{
@@ -274,10 +325,12 @@ static void ESPHome_API_TCP_Server_Thread(void* param)
 		disconnect:
 			ADDLOG_INFO(LOG_FEATURE_DRV, "ESPHomeAPI: Client disconnected or error");
 			g_bt_proxy_forwarding_active = false;
-			xSemaphoreTake(s_send_mutex, portMAX_DELAY);
-			close(client_sock);
-			client_sock = INVALID_SOCK;
-			xSemaphoreGive(s_send_mutex);
+			{
+				int sock = client_sock;
+				client_sock = INVALID_SOCK; // stop other tasks from queueing more
+				ESPHome_API_DrainTx(INVALID_SOCK);
+				close(sock);
+			}
 #if ENABLE_BT_PROXY_GATT
 			// Nobody is left to drive the links; free them for the next client.
 			HAL_BTProxy_GattDisconnectAll();
@@ -296,9 +349,9 @@ bool ESPHome_API_PassScanResult(const uint8_t* mac, int rssi, uint8_t addr_type,
 
 void DRV_ESPHome_API_Init()
 {
-	if(s_send_mutex == NULL)
+	if(s_tx_queue == NULL)
 	{
-		s_send_mutex = xSemaphoreCreateMutex();
+		s_tx_queue = xQueueCreate(TX_QUEUE_LEN, sizeof(tx_frame_t*));
 	}
 	OSStatus err = rtos_create_thread(&s_esphome_api_thread, BEKEN_APPLICATION_PRIORITY - 1,
 		"ESPHomeAPI_Srv",

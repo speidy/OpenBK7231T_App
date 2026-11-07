@@ -147,6 +147,25 @@ static commandResult_t CMD_BTFilterDuplicates(const void* context, const char* c
 #if ENABLE_DRIVER_ESPHOME_API
 #include "../../driver/drv_esphome_api.h"
 #if ENABLE_BT_PROXY_GATT
+static commandResult_t CMD_BTProxyConnect(const void* context, const char* cmd, const char* args, int cmdFlags)
+{
+	// BTProxyConnect AA:BB:CC:DD:EE:FF [addrType] - debug: start a GATT connect locally
+	Tokenizer_TokenizeString(args, 0);
+	const char* mac = Tokenizer_GetArg(0);
+	if(!mac) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	unsigned int b[6];
+	if(sscanf(mac, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return CMD_RES_BAD_ARGUMENT;
+	uint64_t addr = 0;
+	for(int i = 0; i < 6; i++) addr = (addr << 8) | (b[i] & 0xFF);
+	int type = Tokenizer_GetArgIntegerDefault(1, 0);
+	HAL_BTProxy_GattConnect(addr, (uint8_t)type);
+	return CMD_RES_OK;
+}
+static commandResult_t CMD_BTProxyDisconnect(const void* context, const char* cmd, const char* args, int cmdFlags)
+{
+	HAL_BTProxy_GattDisconnectAll();
+	return CMD_RES_OK;
+}
 static commandResult_t CMD_BTProxyStatus(const void* context, const char* cmd, const char* args, int cmdFlags)
 {
 	HAL_BTProxy_LogStatus();
@@ -215,6 +234,16 @@ void HAL_BTProxy_RegisterCommands(void)
 	//cmddetail:"fn":"CMD_BTProxyStatus","file":"hal/generic/hal_bt_proxy_generic.c","requires":"ENABLE_BT_PROXY_GATT",
 	//cmddetail:"examples":""}
 	CMD_RegisterCommand("BTProxyStatus", CMD_BTProxyStatus, NULL);
+	//cmddetail:{"name":"BTProxyConnect","args":"[MAC] [addrType]",
+	//cmddetail:"descr":"Debug: open a BLE GATT connection locally (no API client needed)",
+	//cmddetail:"fn":"CMD_BTProxyConnect","file":"hal/generic/hal_bt_proxy_generic.c","requires":"ENABLE_BT_PROXY_GATT",
+	//cmddetail:"examples":"BTProxyConnect DC:23:4E:D1:FC:A9 0"}
+	CMD_RegisterCommand("BTProxyConnect", CMD_BTProxyConnect, NULL);
+	//cmddetail:{"name":"BTProxyDisconnect","args":"",
+	//cmddetail:"descr":"Debug: disconnect all BLE GATT links",
+	//cmddetail:"fn":"CMD_BTProxyDisconnect","file":"hal/generic/hal_bt_proxy_generic.c","requires":"ENABLE_BT_PROXY_GATT",
+	//cmddetail:"examples":""}
+	CMD_RegisterCommand("BTProxyDisconnect", CMD_BTProxyDisconnect, NULL);
 #endif
 #endif
 #endif
