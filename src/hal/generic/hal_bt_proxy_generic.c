@@ -237,7 +237,7 @@ void HAL_BTProxy_RegisterCommands(void)
 	//cmddetail:{"name":"BTProxyConnect","args":"[MAC] [addrType]",
 	//cmddetail:"descr":"Debug: open a BLE GATT connection locally (no API client needed)",
 	//cmddetail:"fn":"CMD_BTProxyConnect","file":"hal/generic/hal_bt_proxy_generic.c","requires":"ENABLE_BT_PROXY_GATT",
-	//cmddetail:"examples":"BTProxyConnect DC:23:4E:D1:FC:A9 0"}
+	//cmddetail:"examples":"BTProxyConnect AA:BB:CC:DD:EE:FF 0"}
 	CMD_RegisterCommand("BTProxyConnect", CMD_BTProxyConnect, NULL);
 	//cmddetail:{"name":"BTProxyDisconnect","args":"",
 	//cmddetail:"descr":"Debug: disconnect all BLE GATT links",
