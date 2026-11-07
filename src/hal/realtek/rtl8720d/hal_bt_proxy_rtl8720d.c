@@ -538,6 +538,8 @@ static void link_kick(gatt_link_t* l)
 			case GATT_CMD_WRITE:
 				cause = gcs_attr_write(l->conn_id, c->response ? GATT_WRITE_TYPE_REQ : GATT_WRITE_TYPE_CMD,
 					c->handle, c->len, c->data);
+				ADDLOG_EXTRADEBUG(LOG_FEATURE_GENERAL, "BTProxy: write h=%d len=%d %s -> cause %d",
+					c->handle, c->len, c->response ? "req" : "cmd", cause);
 				if(cause == GAP_CAUSE_SUCCESS && !c->response)
 				{
 					// Write Command: no ATT response, HA does not wait either
@@ -585,6 +587,7 @@ static T_APP_RESULT hal_bt_gcs_callback(T_CLIENT_ID client_id, uint8_t conn_id, 
 		case GCS_CLIENT_CB_TYPE_READ_RESULT:
 		{
 			T_GCS_READ_RESULT* r = &cb->cb_content.read_result;
+			ADDLOG_EXTRADEBUG(LOG_FEATURE_GENERAL, "BTProxy: read result h=%d cause 0x%x len=%d", r->handle, r->cause, r->value_size);
 			if(!l->active || l->active->type != GATT_CMD_READ) break;
 			if(r->cause == GAP_SUCCESS) ESPHome_API_BT_OnRead(l->address, l->active->handle, r->p_value, r->value_size);
 			else ESPHome_API_BT_OnError(l->address, l->active->handle, r->cause & 0xFF);
@@ -594,6 +597,7 @@ static T_APP_RESULT hal_bt_gcs_callback(T_CLIENT_ID client_id, uint8_t conn_id, 
 		case GCS_CLIENT_CB_TYPE_WRITE_RESULT:
 		{
 			T_GCS_WRITE_RESULT* w = &cb->cb_content.write_result;
+			ADDLOG_EXTRADEBUG(LOG_FEATURE_GENERAL, "BTProxy: write result h=%d type %d cause 0x%x", w->handle, w->type, w->cause);
 			if(w->type != GATT_WRITE_TYPE_REQ) break; // write commands complete on send
 			if(!l->active || l->active->type != GATT_CMD_WRITE) break;
 			if(w->cause == GAP_SUCCESS) ESPHome_API_BT_OnWrite(l->address, l->active->handle);
@@ -604,6 +608,7 @@ static T_APP_RESULT hal_bt_gcs_callback(T_CLIENT_ID client_id, uint8_t conn_id, 
 		case GCS_CLIENT_CB_TYPE_NOTIF_IND:
 		{
 			T_GCS_NOTIF_IND* n = &cb->cb_content.notif_ind;
+			ADDLOG_EXTRADEBUG(LOG_FEATURE_GENERAL, "BTProxy: %s h=%d len=%d", n->notify ? "notify" : "indicate", n->handle, n->value_size);
 			ESPHome_API_BT_OnNotifyData(l->address, n->handle, n->p_value, n->value_size);
 			break;
 		}
@@ -758,8 +763,12 @@ static void gatt_do_disconnect(gatt_link_t* l)
 	}
 }
 
+static volatile uint32_t g_last_tick_ms = 0;
+static volatile uint32_t g_ticks_posted = 0;
+
 static void gatt_on_tick(void)
 {
+	g_last_tick_ms = g_timeMs;
 	for(int i = 0; i < BT_PROXY_GATT_MAX_LINKS; i++)
 	{
 		gatt_link_t* l = &g_links[i];
@@ -972,6 +981,24 @@ int HAL_BTProxy_GattGetAllocated(uint64_t* allocated, int max, int* limit)
 int HAL_BTProxy_GattGetLinkState(void)
 {
 	return g_link_led_state;
+}
+
+// Diagnostics (BTProxyStatus). Reads BT-task state without locking; values may
+// be slightly stale but this never blocks.
+void HAL_BTProxy_LogStatus(void)
+{
+	ADDLOG_INFO(LOG_FEATURE_GENERAL, "BTProxy: stack_ready %d scan want %d running %d paused %d pkts %d drop %d",
+		g_bt_proxy.stack_ready, g_bt_proxy.scan_active, g_bt_proxy.scan_running, g_bt_proxy.scan_paused,
+		g_bt_proxy.scan_total_packets, g_bt_proxy.scan_dropped_packets);
+	ADDLOG_INFO(LOG_FEATURE_GENERAL, "BTProxy: BT task last tick %d ms ago (posted %d), disc ws %d",
+		(int)(g_timeMs - g_last_tick_ms), (int)g_ticks_posted, g_disc.link);
+	for(int i = 0; i < BT_PROXY_GATT_MAX_LINKS; i++)
+	{
+		gatt_link_t* l = &g_links[i];
+		ADDLOG_INFO(LOG_FEATURE_GENERAL, "BTProxy: link %d state %d conn %d addr %08X%04X mtu %d q %d active %d age %d",
+			i, l->state, l->conn_id, (unsigned)(l->address >> 16), (unsigned)(l->address & 0xFFFF), l->mtu,
+			l->q_count, l->active ? l->active->type : 0, (int)(g_timeMs - l->state_ms));
+	}
 }
 
 static void gatt_handle_gap_msg(T_IO_MSG* io)
@@ -1278,7 +1305,7 @@ void HAL_BTProxy_OnEverySecond(void)
 {
 	if(!g_bt_proxy.stack_ready) return;
 #if ENABLE_BT_PROXY_GATT
-	gatt_post(gatt_cmd_new(GATT_CMD_TICK, 0, 0, 0));
+	if(gatt_post(gatt_cmd_new(GATT_CMD_TICK, 0, 0, 0))) g_ticks_posted++;
 #endif
 	// Scan watchdog: the controller occasionally stops reporting; restart if
 	// we've seen nothing for a minute while we should be scanning.

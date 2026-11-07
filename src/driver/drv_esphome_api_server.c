@@ -46,25 +46,31 @@ static void ESPHome_API_EncodeVarint(uint8_t** buf, uint32_t value)
 	(*buf)++;
 }
 
-// Writes all bytes of a buffer on the (blocking) client socket.
-// Droppable frames are first tried with MSG_DONTWAIT so a congested link drops
-// advertisements instead of stalling the BT task. We cannot rely on errno to
-// tell "would block" from a real error on every SDK, so any failure before the
-// first byte of a droppable frame is treated as "drop".
+// Writes all bytes of a buffer to the client socket without ever blocking
+// indefinitely: every send uses MSG_DONTWAIT and is retried for a bounded time.
+// (On RTL87X0C lwIP, SO_SNDTIMEO/errno can't be trusted, and a send() that
+// blocks forever stalls the BT task.) A failed send cannot be told apart from
+// "would block", so both are retried until the deadline.
+// Droppable frames give up immediately if nothing could be written.
 // Returns number of bytes written (== len on success).
+#define SEND_RETRY_DELAY_MS 5
+#define SEND_MAX_RETRIES 300 // ~1.5 s
 static int ESPHome_API_SendAll(int sock, const uint8_t* data, int len, bool droppable)
 {
 	int sent = 0;
+	int retries = 0;
 	while(sent < len)
 	{
-		int flags = (droppable && sent == 0) ? MSG_DONTWAIT : 0;
-		int ret = send(sock, data + sent, len - sent, flags);
+		int ret = send(sock, data + sent, len - sent, MSG_DONTWAIT);
 		if(ret > 0)
 		{
 			sent += ret;
+			retries = 0;
 			continue;
 		}
-		break;
+		if(droppable && sent == 0) break;
+		if(++retries > SEND_MAX_RETRIES) break;
+		rtos_delay_milliseconds(SEND_RETRY_DELAY_MS);
 	}
 	return sent;
 }

@@ -123,6 +123,7 @@ void HAL_BTProxy_GattDisconnectAll(void);
 int HAL_BTProxy_GattGetAllocated(uint64_t* allocated, int max, int* limit);
 // For status LEDs: 0 = no link, 1 = connecting/discovering, 2 = connected
 int HAL_BTProxy_GattGetLinkState(void);
+void HAL_BTProxy_LogStatus(void);
 #endif // ENABLE_BT_PROXY_GATT
 
 #endif // ENABLE_BT_PROXY

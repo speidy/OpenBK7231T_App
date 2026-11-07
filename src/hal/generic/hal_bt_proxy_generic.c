@@ -146,6 +146,13 @@ static commandResult_t CMD_BTFilterDuplicates(const void* context, const char* c
 
 #if ENABLE_DRIVER_ESPHOME_API
 #include "../../driver/drv_esphome_api.h"
+#if ENABLE_BT_PROXY_GATT
+static commandResult_t CMD_BTProxyStatus(const void* context, const char* cmd, const char* args, int cmdFlags)
+{
+	HAL_BTProxy_LogStatus();
+	return CMD_RES_OK;
+}
+#endif
 static commandResult_t CMD_BTProxyLeds(const void* context, const char* cmd, const char* args, int cmdFlags)
 {
 	Tokenizer_TokenizeString(args, 0);
@@ -202,6 +209,13 @@ void HAL_BTProxy_RegisterCommands(void)
 	//cmddetail:"fn":"CMD_BTProxyLeds","file":"hal/generic/hal_bt_proxy_generic.c","requires":"ENABLE_DRIVER_ESPHOME_API",
 	//cmddetail:"examples":"BTProxyLeds 60 61"}
 	CMD_RegisterCommand("BTProxyLeds", CMD_BTProxyLeds, NULL);
+#if ENABLE_BT_PROXY_GATT
+	//cmddetail:{"name":"BTProxyStatus","args":"",
+	//cmddetail:"descr":"Log BT proxy scan/link/task diagnostics",
+	//cmddetail:"fn":"CMD_BTProxyStatus","file":"hal/generic/hal_bt_proxy_generic.c","requires":"ENABLE_BT_PROXY_GATT",
+	//cmddetail:"examples":""}
+	CMD_RegisterCommand("BTProxyStatus", CMD_BTProxyStatus, NULL);
+#endif
 #endif
 #endif
 
