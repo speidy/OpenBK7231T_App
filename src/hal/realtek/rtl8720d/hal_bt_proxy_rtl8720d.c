@@ -1267,20 +1267,24 @@ void HAL_BTProxy_GetMAC(uint8_t* mac)
 void HAL_BTProxy_SetScanMode(bool isActive)
 {
 	scan_mode = isActive == true ? GAP_SCAN_MODE_ACTIVE : GAP_SCAN_MODE_PASSIVE;
-	if(g_bt_proxy.init_done)
+	// Before the stack is ready, just remember it: hal_bt_task applies scan_mode
+	// during init. The new mode takes effect the next time scanning starts.
+	if(g_bt_proxy.stack_ready)
 	{
+		bool was_running = g_bt_proxy.scan_running;
+		if(was_running)
+		{
+			le_scan_stop();
+			g_bt_proxy.scan_running = false;
+		}
 		le_scan_set_param(GAP_PARAM_SCAN_MODE, sizeof(scan_mode), &scan_mode);
+		if(was_running) hal_bt_scan_apply();
 	}
 }
 
 bool HAL_BTProxy_GetScanMode(void)
 {
-	if(!g_bt_proxy.init_done) return false;
-	uint8_t scan_mode;
-	T_GAP_CAUSE cause = le_scan_get_param(GAP_PARAM_SCAN_MODE, &scan_mode);
-	if(cause) return false;
-	if(scan_mode == GAP_SCAN_MODE_ACTIVE) return true;
-	else return false;
+	return scan_mode == GAP_SCAN_MODE_ACTIVE;
 }
 
 void HAL_BTProxy_SetWindowInterval(uint16_t window, uint16_t interval)
