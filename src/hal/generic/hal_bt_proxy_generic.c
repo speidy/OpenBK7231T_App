@@ -144,6 +144,18 @@ static commandResult_t CMD_BTFilterDuplicates(const void* context, const char* c
 	return CMD_RES_OK;
 }
 
+#if ENABLE_DRIVER_ESPHOME_API
+#include "../../driver/drv_esphome_api.h"
+static commandResult_t CMD_BTProxyLeds(const void* context, const char* cmd, const char* args, int cmdFlags)
+{
+	Tokenizer_TokenizeString(args, 0);
+	int red = Tokenizer_GetArgIntegerDefault(0, -1);
+	int blue = Tokenizer_GetArgIntegerDefault(1, -1);
+	ESPHome_API_SetStatusLeds(red, blue);
+	return CMD_RES_OK;
+}
+#endif
+
 #endif
 
 void HAL_BTProxy_RegisterCommands(void)
@@ -184,6 +196,13 @@ void HAL_BTProxy_RegisterCommands(void)
 	//cmddetail:"fn":"CMD_BTFilterDuplicates","file":"hal/generic/hal_bt_proxy_generic.c","requires":"ENABLE_BT_PROXY",
 	//cmddetail:"examples":""}
 	CMD_RegisterCommand("BTFilterDuplicates", CMD_BTFilterDuplicates, NULL);
+#if ENABLE_DRIVER_ESPHOME_API
+	//cmddetail:{"name":"BTProxyLeds","args":"[redChannel] [blueChannel]",
+	//cmddetail:"descr":"Status LEDs for the ESPHome BT proxy. Blue: Home Assistant connected. Red: blinking while connecting/discovering, solid while a BLE device is connected. -1 disables.",
+	//cmddetail:"fn":"CMD_BTProxyLeds","file":"hal/generic/hal_bt_proxy_generic.c","requires":"ENABLE_DRIVER_ESPHOME_API",
+	//cmddetail:"examples":"BTProxyLeds 60 61"}
+	CMD_RegisterCommand("BTProxyLeds", CMD_BTProxyLeds, NULL);
+#endif
 #endif
 
 	HAL_BTProxy_RegisterPlatformCommands();

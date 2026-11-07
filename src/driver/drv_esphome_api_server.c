@@ -3,6 +3,7 @@
 #include "../cmnds/cmd_public.h"
 #include "drv_esphome_api.h"
 #include "../hal/hal_bt_proxy.h"
+#include "../new_pins.h"
 #include <lwip/sockets.h>
 
 #if ENABLE_DRIVER_ESPHOME_API
@@ -22,7 +23,96 @@ extern int Main_HasWiFiConnected();
 
 static int s_listen_sock = INVALID_SOCK;
 static xTaskHandle s_esphome_api_thread = NULL;
-static int client_sock = INVALID_SOCK;
+static volatile int client_sock = INVALID_SOCK;
+// Serialises whole frames: the server thread (handshake replies) and the BT task
+// (advertisements, GATT results) both write to the same socket.
+static SemaphoreHandle_t s_send_mutex = NULL;
+
+// Optional status LEDs (channel indices, -1 = disabled), set by BTProxyLeds
+static int s_led_red_ch = -1;
+static int s_led_blue_ch = -1;
+static int s_led_red_val = -1;
+static int s_led_blue_val = -1;
+
+static void ESPHome_API_EncodeVarint(uint8_t** buf, uint32_t value)
+{
+	while(value >= 0x80)
+	{
+		**buf = (value & 0x7F) | 0x80;
+		(*buf)++;
+		value >>= 7;
+	}
+	**buf = value & 0x7F;
+	(*buf)++;
+}
+
+// Writes all bytes of a buffer on the (blocking) client socket.
+// Droppable frames are first tried with MSG_DONTWAIT so a congested link drops
+// advertisements instead of stalling the BT task. We cannot rely on errno to
+// tell "would block" from a real error on every SDK, so any failure before the
+// first byte of a droppable frame is treated as "drop".
+// Returns number of bytes written (== len on success).
+static int ESPHome_API_SendAll(int sock, const uint8_t* data, int len, bool droppable)
+{
+	int sent = 0;
+	while(sent < len)
+	{
+		int flags = (droppable && sent == 0) ? MSG_DONTWAIT : 0;
+		int ret = send(sock, data + sent, len - sent, flags);
+		if(ret > 0)
+		{
+			sent += ret;
+			continue;
+		}
+		break;
+	}
+	return sent;
+}
+
+bool ESPHome_API_IsClientConnected(void)
+{
+	return client_sock != INVALID_SOCK;
+}
+
+bool ESPHome_API_SendFrame(uint32_t msg_type, const uint8_t* payload, uint32_t payload_len, bool droppable)
+{
+	if(client_sock == INVALID_SOCK || s_send_mutex == NULL) return false;
+	uint8_t header[16];
+	uint8_t* ptr = header;
+	*ptr++ = 0x00; // Preamble
+	ESPHome_API_EncodeVarint(&ptr, payload_len);
+	ESPHome_API_EncodeVarint(&ptr, msg_type);
+	int header_len = ptr - header;
+
+	bool ok = false;
+	xSemaphoreTake(s_send_mutex, portMAX_DELAY);
+	int sock = client_sock;
+	if(sock != INVALID_SOCK)
+	{
+		int n = ESPHome_API_SendAll(sock, header, header_len, droppable);
+		if(n == header_len)
+		{
+			ok = true;
+			if(payload_len > 0)
+			{
+				// once the header is out, the payload must follow or the stream is corrupt
+				ok = ESPHome_API_SendAll(sock, payload, payload_len, false) == (int)payload_len;
+			}
+			if(!ok)
+			{
+				ADDLOG_ERROR(LOG_FEATURE_DRV, "ESPHomeAPI: send failed mid-frame (type %d), dropping client", msg_type);
+				shutdown(sock, SHUT_RDWR);
+			}
+		}
+		else if(n > 0)
+		{
+			ADDLOG_ERROR(LOG_FEATURE_DRV, "ESPHomeAPI: partial header send, dropping client");
+			shutdown(sock, SHUT_RDWR);
+		}
+	}
+	xSemaphoreGive(s_send_mutex);
+	return ok;
+}
 
 static void ESPHome_API_TCP_Server_Thread(void* param)
 {
@@ -75,8 +165,13 @@ static void ESPHome_API_TCP_Server_Thread(void* param)
 
 		if(client_sock != INVALID_SOCK)
 		{
-			int flags = fcntl(client_sock, F_GETFL, 0);
-			fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
+			// Blocking socket + select(): on some SDKs (RTL87X0C) a non-blocking
+			// recv() with no data returns -1 with errno == 0, which is
+			// indistinguishable from a real error.
+			struct timeval snd_tv = { 2, 0 };
+			setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&snd_tv, sizeof(snd_tv));
+			int nodelay = 1;
+			setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
 			ADDLOG_INFO(LOG_FEATURE_DRV, "ESPHomeAPI: Client connected (sock %d)", client_sock);
 
 			// ESPHome Native API Framing Decoder
@@ -88,6 +183,17 @@ static void ESPHome_API_TCP_Server_Thread(void* param)
 				if(read_len == sizeof(buffer))
 				{
 					goto disconnect;
+				}
+				fd_set rfds;
+				FD_ZERO(&rfds);
+				FD_SET(client_sock, &rfds);
+				struct timeval tv = { 0, 200 * 1000 };
+				int sel = select(client_sock + 1, &rfds, NULL, NULL, &tv);
+				if(sel == 0) continue;
+				if(sel < 0)
+				{
+					ADDLOG_INFO(LOG_FEATURE_DRV, "ESPHomeAPI: select failed (%d)", sel);
+					break;
 				}
 				int ret = recv(client_sock, buffer + read_len, sizeof(buffer) - read_len, 0);
 				if(ret > 0)
@@ -153,21 +259,23 @@ static void ESPHome_API_TCP_Server_Thread(void* param)
 						}
 					}
 				}
-				else if(ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-				{
-					rtos_delay_milliseconds(10);
-					continue;
-				}
 				else
 				{
+					ADDLOG_INFO(LOG_FEATURE_DRV, "ESPHomeAPI: recv returned %d", ret);
 					break; // Error or closed
 				}
 			}
 		disconnect:
 			ADDLOG_INFO(LOG_FEATURE_DRV, "ESPHomeAPI: Client disconnected or error");
 			g_bt_proxy_forwarding_active = false;
+			xSemaphoreTake(s_send_mutex, portMAX_DELAY);
 			close(client_sock);
 			client_sock = INVALID_SOCK;
+			xSemaphoreGive(s_send_mutex);
+#if ENABLE_BT_PROXY_GATT
+			// Nobody is left to drive the links; free them for the next client.
+			HAL_BTProxy_GattDisconnectAll();
+#endif
 		}
 		rtos_delay_milliseconds(50);
 	}
@@ -182,6 +290,10 @@ bool ESPHome_API_PassScanResult(const uint8_t* mac, int rssi, uint8_t addr_type,
 
 void DRV_ESPHome_API_Init()
 {
+	if(s_send_mutex == NULL)
+	{
+		s_send_mutex = xSemaphoreCreateMutex();
+	}
 	OSStatus err = rtos_create_thread(&s_esphome_api_thread, BEKEN_APPLICATION_PRIORITY - 1,
 		"ESPHomeAPI_Srv",
 		(beken_thread_function_t)ESPHome_API_TCP_Server_Thread,
@@ -207,11 +319,38 @@ void DRV_ESPHome_API_Deinit()
 	}
 }
 
+void ESPHome_API_SetStatusLeds(int red_ch, int blue_ch)
+{
+	s_led_red_ch = red_ch;
+	s_led_blue_ch = blue_ch;
+	s_led_red_val = -1;
+	s_led_blue_val = -1;
+}
+
+static void ESPHome_API_UpdateLed(int ch, int* last, int val)
+{
+	if(ch < 0) return;
+	if(*last == val) return;
+	*last = val;
+	CHANNEL_Set(ch, val, 0);
+}
+
 void DRV_ESPHome_API_OnEverySecond()
 {
 #if ENABLE_BT_PROXY
 	HAL_BTProxy_OnEverySecond();
 #endif
+	// Blue: Home Assistant connected and subscribed to the proxy.
+	ESPHome_API_UpdateLed(s_led_blue_ch, &s_led_blue_val,
+		(client_sock != INVALID_SOCK && g_bt_proxy_forwarding_active) ? 1 : 0);
+	// Red: off = no BLE link, blinking = connecting/discovering, on = connected.
+	int red = 0;
+#if ENABLE_BT_PROXY_GATT
+	int link = HAL_BTProxy_GattGetLinkState();
+	if(link == 2) red = 1;
+	else if(link == 1) red = (s_led_red_val == 1) ? 0 : 1;
+#endif
+	ESPHome_API_UpdateLed(s_led_red_ch, &s_led_red_val, red);
 }
 
 #endif // ENABLE_DRIVER_ESPHOME_API
