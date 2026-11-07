@@ -70,10 +70,12 @@ static void pb_encode_bytes_field(uint8_t** buf, int field_idx, const uint8_t* d
 	*buf += len;
 }
 
+// client_sock >= 0 means we are on the API server thread replying to a request;
+// anything else (e.g. -1 from the BT task) goes through the TX queue.
 static void PB_SendFrame(int client_sock, uint32_t msg_type, uint8_t* payload, uint32_t payload_len)
 {
-	(void)client_sock;
-	ESPHome_API_SendFrame(msg_type, payload, payload_len, false);
+	if(client_sock >= 0) ESPHome_API_SendFrameNow(client_sock, msg_type, payload, payload_len);
+	else ESPHome_API_SendFrame(msg_type, payload, payload_len, false);
 }
 
 void ESPHome_API_Send_HelloResponse(int client_sock)

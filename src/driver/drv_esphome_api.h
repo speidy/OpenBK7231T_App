@@ -61,6 +61,8 @@
 // Thread-safe frame send to the connected client (serialised by a mutex).
 // droppable: if the socket is congested before anything was written, drop instead of waiting.
 bool ESPHome_API_SendFrame(uint32_t msg_type, const uint8_t* payload, uint32_t payload_len, bool droppable);
+// Server thread only (replying to a request on that thread's socket).
+bool ESPHome_API_SendFrameNow(int sock, uint32_t msg_type, const uint8_t* payload, uint32_t payload_len);
 bool ESPHome_API_IsClientConnected(void);
 void ESPHome_API_SetStatusLeds(int red_ch, int blue_ch);
 

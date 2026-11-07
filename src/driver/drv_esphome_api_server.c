@@ -39,7 +39,6 @@ typedef struct
 #define TX_QUEUE_LEN 48
 #define TX_POLL_MS 20
 static QueueHandle_t s_tx_queue = NULL;
-static volatile TaskHandle_t s_server_task = NULL;
 static volatile int s_tx_dropped = 0;
 
 // Optional status LEDs (channel indices, -1 = disabled), set by BTProxyLeds
@@ -123,9 +122,8 @@ static void ESPHome_API_DrainTx(int sock)
 	}
 }
 
-bool ESPHome_API_SendFrame(uint32_t msg_type, const uint8_t* payload, uint32_t payload_len, bool droppable)
+static tx_frame_t* ESPHome_API_BuildFrame(uint32_t msg_type, const uint8_t* payload, uint32_t payload_len)
 {
-	if(client_sock == INVALID_SOCK || s_tx_queue == NULL) return false;
 	uint8_t header[16];
 	uint8_t* ptr = header;
 	*ptr++ = 0x00; // Preamble
@@ -135,25 +133,36 @@ bool ESPHome_API_SendFrame(uint32_t msg_type, const uint8_t* payload, uint32_t p
 	int total = header_len + payload_len;
 
 	tx_frame_t* f = (tx_frame_t*)os_malloc(sizeof(tx_frame_t) + total);
+	if(!f) return NULL;
+	f->len = (uint16_t)total;
+	memcpy(f->data, header, header_len);
+	if(payload_len) memcpy(f->data + header_len, payload, payload_len);
+	return f;
+}
+
+// Server thread only (replies to requests): flush queued frames first to keep
+// ordering, then write this one.
+bool ESPHome_API_SendFrameNow(int sock, uint32_t msg_type, const uint8_t* payload, uint32_t payload_len)
+{
+	if(sock == INVALID_SOCK) return false;
+	tx_frame_t* f = ESPHome_API_BuildFrame(msg_type, payload, payload_len);
+	if(!f) return false;
+	ESPHome_API_DrainTx(sock);
+	bool ok = ESPHome_API_WriteFrame(sock, f->data, f->len, false);
+	os_free(f);
+	return ok;
+}
+
+// Any thread: queue a frame for the server thread to send.
+bool ESPHome_API_SendFrame(uint32_t msg_type, const uint8_t* payload, uint32_t payload_len, bool droppable)
+{
+	if(client_sock == INVALID_SOCK || s_tx_queue == NULL) return false;
+	tx_frame_t* f = ESPHome_API_BuildFrame(msg_type, payload, payload_len);
 	if(!f)
 	{
 		s_tx_dropped++;
 		return false;
 	}
-	f->len = (uint16_t)total;
-	memcpy(f->data, header, header_len);
-	if(payload_len) memcpy(f->data + header_len, payload, payload_len);
-
-	if(xTaskGetCurrentTaskHandle() == s_server_task)
-	{
-		// Already on the socket's thread: keep ordering with anything queued, then write.
-		int sock = client_sock;
-		ESPHome_API_DrainTx(sock);
-		bool ok = sock != INVALID_SOCK && ESPHome_API_WriteFrame(sock, f->data, f->len, droppable);
-		os_free(f);
-		return ok;
-	}
-
 	// Advertisements are dropped if the queue is full; GATT results wait briefly.
 	TickType_t wait = droppable ? 0 : pdMS_TO_TICKS(500);
 	if(xQueueSend(s_tx_queue, &f, wait) != pdTRUE)
@@ -208,7 +217,6 @@ static void ESPHome_API_TCP_Server_Thread(void* param)
 	}
 
 	ADDLOG_INFO(LOG_FEATURE_DRV, "ESPHomeAPI: TCP Server listening on port %d", ESPHOME_API_PORT);
-	s_server_task = xTaskGetCurrentTaskHandle();
 
 	while(1)
 	{
